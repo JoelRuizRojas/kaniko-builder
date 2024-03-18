@@ -1,0 +1,134 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kaniko-builder
+  namespace: kaniko
+spec:
+  restartPolicy: Never
+
+  # User init container to check if target images are available in docker hub
+  initContainers: 
+  - name: kaniko-init
+    image: docker:20.10
+    command:
+    - sh
+    - -c
+    - | 
+      # Check if image name was given
+      [[ ! -z "${DOCKER_IMAGENAME}" && ! -z "${DOCKER_IMAGETAG}" ]] || {
+          echo -e "\nDOCKER_IMAGENAME and/or DOCKER_IMAGETAG environment variables not set using configMaps!!!\n"
+          exit 2
+      }
+
+      # Check if user desires to build the image regardless if it exists in registry
+      [[ "${FORCE_BUILD}" != "Y" ]] || {
+          echo -e "\nForce build!!!\n"
+          exit 0
+      }
+
+      # Docker registry secret is mapped to /root/.docker but since 
+      # docker container expects the credentials to be read from a file
+      # labelled as config.json, lets do that next
+      mkdir -p /workspace/.docker
+      cp /root/.docker/.dockerconfigjson /workspace/.docker/config.json
+
+      # Extract the username from mounted registry secret
+      registrySecret=$(cat /workspace/.docker/config.json)
+      pattern='"username":"([^"]+)"'
+      if echo "$registrySecret" | grep -qE "$pattern"; then
+          # Extract the value from the first capturing group
+          docker_username=$(echo "$registrySecret" | 
+                            grep -Eo "$pattern" | 
+                            sed 's/.*"\([^"]\+\)".*/\1/')
+      fi
+
+      # Check if images are in docker hub
+      if docker manifest inspect docker.io/$docker_username/${DOCKER_IMAGENAME}:${DOCKER_IMAGETAG} > /dev/null 2>&1
+      then
+          echo -e "\n${DOCKER_IMAGENAME}:${DOCKER_IMAGETAG} image available!!!\n"
+          exit 1
+      else
+          echo -e "\n${DOCKER_IMAGENAME}:${DOCKER_IMAGETAG} NOT available. Running builder container!!!\n"
+          exit 0
+      fi
+    env:
+    - name: DOCKER_CONFIG
+      value: /workspace/.docker
+    - name: DOCKER_IMAGENAME
+      valueFrom:
+        configMapKeyRef:
+          name: my-kaniko-builder-configmap
+          key: DOCKER_IMAGENAME
+    - name: DOCKER_IMAGETAG
+      valueFrom:
+        configMapKeyRef:
+          name: my-kaniko-builder-configmap
+          key: DOCKER_IMAGETAG
+    - name: FORCE_BUILD
+      valueFrom:
+        configMapKeyRef:
+          name: my-kaniko-builder-configmap
+          key: FORCE_BUILD
+    volumeMounts:
+    - name: docker-secret
+      mountPath: /root/.docker
+
+  # Use next container to build the login server image and push it to docker hub
+  containers:
+  - name: image-builder
+    image: gcr.io/kaniko-project/executor:v1.20.0-debug
+    command:
+    - sh
+    - -c
+    - |
+      # Docker registry secret is mapped to /root/.docker but since
+      # docker container expects the credentials to be read from a file
+      # labelled as config.json, lets do that next
+      mkdir -p /workspace/.docker
+      cp /root/.docker/.dockerconfigjson /workspace/.docker/config.json
+
+      # Extract the username from mounted registry secret
+      registrySecret=$(cat /workspace/.docker/config.json)
+      pattern='"username":"([^"]+)"'
+      if echo "$registrySecret" | grep -qE "$pattern"; then
+          # Extract the value from the first capturing group
+          docker_username=$(echo "$registrySecret" |
+                            grep -Eo "$pattern" |
+                            sed 's/.*"\([^"]\+\)".*/\1/')
+      fi
+
+      /kaniko/executor \
+      --context /workspace \
+      --dockerfile /workspace/${DOCKER_FILENAME} \
+      --destination docker.io/$docker_username/${DOCKER_IMAGENAME}:${DOCKER_IMAGETAG}
+    env:
+    - name: DOCKER_CONFIG
+      value: /workspace/.docker
+    - name: DOCKER_FILENAME
+      valueFrom:
+        configMapKeyRef:
+          name: my-kaniko-builder-configmap
+          key: DOCKER_FILENAME
+    - name: DOCKER_IMAGENAME
+      valueFrom:
+        configMapKeyRef:
+          name: my-kaniko-builder-configmap
+          key: DOCKER_IMAGENAME
+    - name: DOCKER_IMAGETAG
+      valueFrom:
+        configMapKeyRef:
+          name: my-kaniko-builder-configmap
+          key: DOCKER_IMAGETAG
+    volumeMounts:
+    - name: dockerfiles
+      mountPath: /workspace
+    - name: docker-secret
+      mountPath: /root/.docker
+
+  volumes:
+  - name: dockerfiles
+    hostPath:
+      path: /workspace
+  - name: docker-secret
+    secret:
+      secretName: docker-config-secret
